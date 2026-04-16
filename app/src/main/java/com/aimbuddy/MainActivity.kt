@@ -23,6 +23,7 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.provider.Settings
+import android.provider.OpenableColumns
 import android.text.TextUtils
 import android.util.DisplayMetrics
 import android.util.Log
@@ -102,6 +103,9 @@ class MainActivity : AppCompatActivity() {
         private const val PREF_MODEL_BIN_PATH = "model_bin_path"
         private const val ASSET_MODEL_PARAM = "models/yolo26n-opt.param"
         private const val ASSET_MODEL_BIN = "models/yolo26n-opt.bin"
+        private const val STORE_OWNER = "1337Xcode"
+        private const val STORE_REPO = "AimBuddy"
+        private const val STORE_BRANCH = "master"
 
         init {
             System.loadLibrary("esp_native")
@@ -111,6 +115,7 @@ class MainActivity : AppCompatActivity() {
     // UI state
     private var isRunningState by mutableStateOf(false)
     private var statusTextState by mutableStateOf("Status: Model Loading")
+    private var activeModelTextState by mutableStateOf("Model: Auto")
 
     // Overlay components
     private var imguiOverlay: ImGuiGLSurface? = null
@@ -123,6 +128,15 @@ class MainActivity : AppCompatActivity() {
     private val rootCheckInProgress = AtomicBoolean(false)
     private val rootAvailable = AtomicBoolean(false)
     private var pendingStartAfterRoot = false
+    private var pendingImportParamUri: Uri? = null
+    private var pendingImportName: String = "local-model"
+
+    private lateinit var modelCatalog: ModelCatalog
+    private val storeRepository = ModelStoreRepository(
+        owner = STORE_OWNER,
+        repo = STORE_REPO,
+        branch = STORE_BRANCH
+    )
 
     // Floating menu icon overlay
     private var floatingIconView: ImageView? = null
@@ -176,16 +190,8 @@ class MainActivity : AppCompatActivity() {
         if (uri == null) {
             return@registerForActivityResult
         }
-        val importedParam = copyModelFromUri(uri, "custom-yolo.param")
-        if (importedParam == null) {
-            showAppToast("Failed to import .param model file", true)
-            return@registerForActivityResult
-        }
-
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            .edit()
-            .putString(PREF_MODEL_PARAM_PATH, importedParam.absolutePath)
-            .apply()
+        pendingImportParamUri = uri
+        pendingImportName = getDisplayName(uri).substringBeforeLast('.', "local-model")
 
         showAppToast(".param imported. Now select the matching .bin file.", false)
         importBinLauncher.launch(arrayOf("application/octet-stream", "*/*"))
@@ -195,24 +201,38 @@ class MainActivity : AppCompatActivity() {
         if (uri == null) {
             return@registerForActivityResult
         }
-        val importedBin = copyModelFromUri(uri, "custom-yolo.bin")
-        if (importedBin == null) {
-            showAppToast("Failed to import .bin model file", true)
-            return@registerForActivityResult
-        }
-
-        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        val paramPath = prefs.getString(PREF_MODEL_PARAM_PATH, null)
-            ?: File(filesDir, "models/custom-yolo.param").takeIf { it.exists() }?.absolutePath
-
-        if (paramPath == null) {
+        val paramUri = pendingImportParamUri
+        if (paramUri == null) {
             showAppToast("Select .param first, then .bin.", true)
             return@registerForActivityResult
         }
 
-        persistAndApplyModelPaths(paramPath, importedBin.absolutePath)
+        val modelId = modelCatalog.sanitizeModelId("local-${pendingImportName}-${System.currentTimeMillis()}")
+        val installDir = File(filesDir, "models/$modelId")
+        val paramFile = File(installDir, "$modelId.param")
+        val binFile = File(installDir, "$modelId.bin")
+
+        val paramOk = copyUriToFile(paramUri, paramFile)
+        val binOk = copyUriToFile(uri, binFile)
+        if (!paramOk || !binOk) {
+            showAppToast("Failed to import selected model files", true)
+            return@registerForActivityResult
+        }
+
+        val installed = InstalledModel(
+            id = modelId,
+            title = pendingImportName,
+            description = "Imported from local storage",
+            source = ModelSource.LOCAL,
+            paramPath = paramFile.absolutePath,
+            binPath = binFile.absolutePath,
+            totalSizeBytes = paramFile.length() + binFile.length()
+        )
+        modelCatalog.addOrUpdateModel(installed, makeActive = true)
+        applyActiveModelSelection()
         showAppToast("Model imported from storage", false)
         reinitializeNativeIfIdle()
+        pendingImportParamUri = null
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -227,6 +247,7 @@ class MainActivity : AppCompatActivity() {
                     ControlScreen(
                         isRunning = isRunningState,
                         statusText = statusTextState,
+                        activeModelText = activeModelTextState,
                         onStart = { onStartClicked() },
                         onStop = { onStopClicked() }
                     )
@@ -258,6 +279,7 @@ class MainActivity : AppCompatActivity() {
         Log.i(TAG, "Screen: ${screenWidth}x${screenHeight}, density: $screenDensity")
 
         setStatus("Status: Model Loading")
+        modelCatalog = ModelCatalog(this)
 
         val hasAssetParam = assetExists(ASSET_MODEL_PARAM)
         val hasAssetBin = assetExists(ASSET_MODEL_BIN)
@@ -269,18 +291,9 @@ class MainActivity : AppCompatActivity() {
             showAppToast("Missing model in assets: $missing", true)
         }
 
-        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        val persistedParamPath = prefs.getString(PREF_MODEL_PARAM_PATH, null)
-        val persistedBinPath = prefs.getString(PREF_MODEL_BIN_PATH, null)
-        val localParamExists = persistedParamPath != null && File(persistedParamPath).exists()
-        val localBinExists = persistedBinPath != null && File(persistedBinPath).exists()
-
-        if (localParamExists && localBinExists) {
-            nativeSetModelPaths(persistedParamPath, persistedBinPath)
-            Log.i(TAG, "Using imported local model files")
-        } else {
-            nativeSetModelPaths(null, null)
-        }
+        modelCatalog.ensureDefaultAssetModel(hasAssetParam, hasAssetBin)
+        migrateLegacySingleImportedModel()
+        applyActiveModelSelection()
 
         // Get MediaProjectionManager
         mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE)
@@ -605,34 +618,53 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun copyModelFromUri(uri: Uri, outputName: String): File? {
+    private fun copyUriToFile(uri: Uri, outFile: File): Boolean {
         return try {
-            val modelDir = File(filesDir, "models")
+            val modelDir = outFile.parentFile
+            if (modelDir == null) {
+                return false
+            }
             if (!modelDir.exists() && !modelDir.mkdirs()) {
                 Log.e(TAG, "Failed to create local model directory")
-                return null
+                return false
             }
-            val outFile = File(modelDir, outputName)
             contentResolver.openInputStream(uri)?.use { input ->
                 FileOutputStream(outFile).use { output ->
                     input.copyTo(output)
                 }
-            } ?: return null
-            outFile
+            } ?: return false
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to copy model from uri: ${e.message}", e)
-            null
+            false
         }
     }
 
-    private fun persistAndApplyModelPaths(paramPath: String, binPath: String) {
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            .edit()
-            .putString(PREF_MODEL_PARAM_PATH, paramPath)
-            .putString(PREF_MODEL_BIN_PATH, binPath)
-            .apply()
+    private fun getDisplayName(uri: Uri): String {
+        var name = "model"
+        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (index >= 0 && cursor.moveToFirst()) {
+                name = cursor.getString(index) ?: name
+            }
+        }
+        return name
+    }
 
-        nativeSetModelPaths(paramPath, binPath)
+    private fun applyActiveModelSelection() {
+        val active = modelCatalog.getActiveModel()
+        if (active == null) {
+            nativeSetModelPaths(null, null)
+            activeModelTextState = "Model: Missing"
+            return
+        }
+
+        if (active.source == ModelSource.ASSET) {
+            nativeSetModelPaths(null, null)
+        } else {
+            nativeSetModelPaths(active.paramPath, active.binPath)
+        }
+        activeModelTextState = "Model: ${active.title} (${active.source.name.lowercase()})"
     }
 
     private fun reinitializeNativeIfIdle() {
@@ -641,6 +673,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
         nativeShutdown()
+        applyActiveModelSelection()
         if (nativeInit(assets, screenWidth, screenHeight)) {
             if (rootAvailable.get()) {
                 nativeInitAimbot()
@@ -655,14 +688,207 @@ class MainActivity : AppCompatActivity() {
 
     private fun onImportModelClicked() {
         try {
-            importParamLauncher.launch(arrayOf("*/*"))
+            importParamLauncher.launch(arrayOf("application/octet-stream", "*/*"))
         } catch (e: ActivityNotFoundException) {
             showAppToast("No file picker found on this device", true)
         }
     }
 
     private fun onStoreClicked() {
-        showAppToast("Model Store: Coming soon", false)
+        showModelSwitcherDialog()
+    }
+
+    private fun migrateLegacySingleImportedModel() {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val legacyParam = prefs.getString(PREF_MODEL_PARAM_PATH, null)
+        val legacyBin = prefs.getString(PREF_MODEL_BIN_PATH, null)
+        if (legacyParam.isNullOrBlank() || legacyBin.isNullOrBlank()) {
+            return
+        }
+
+        val paramFile = File(legacyParam)
+        val binFile = File(legacyBin)
+        if (!paramFile.exists() || !binFile.exists()) {
+            return
+        }
+
+        val legacyModel = InstalledModel(
+            id = modelCatalog.sanitizeModelId("legacy-local-model"),
+            title = "Legacy Imported Model",
+            description = "Migrated from previous app version",
+            source = ModelSource.LOCAL,
+            paramPath = paramFile.absolutePath,
+            binPath = binFile.absolutePath,
+            totalSizeBytes = paramFile.length() + binFile.length()
+        )
+        modelCatalog.addOrUpdateModel(legacyModel, makeActive = false)
+    }
+
+    private fun showModelSwitcherDialog() {
+        val models = modelCatalog.getInstalledModels()
+        if (models.isEmpty()) {
+            showAppToast("No models installed. Import locally or open store.", true)
+            return
+        }
+
+        val activeId = modelCatalog.getActiveModel()?.id
+        val selectedIndex = models.indexOfFirst { it.id == activeId }.coerceAtLeast(0)
+        var chosen = selectedIndex
+
+        val labels = models.map {
+            val size = if (it.totalSizeBytes > 0L) " - ${formatBytes(it.totalSizeBytes)}" else ""
+            "${it.title} [${it.source.name.lowercase()}]$size"
+        }.toTypedArray()
+
+        AlertDialog.Builder(this)
+            .setTitle("Select Active Model")
+            .setSingleChoiceItems(labels, selectedIndex) { _, which ->
+                chosen = which
+            }
+            .setPositiveButton("Use") { _, _ ->
+                val chosenModel = models[chosen]
+                if (modelCatalog.setActiveModel(chosenModel.id)) {
+                    applyActiveModelSelection()
+                    reinitializeNativeIfIdle()
+                } else {
+                    showAppToast("Selected model is not available", true)
+                }
+            }
+            .setNeutralButton("Store") { _, _ ->
+                showStoreDialog()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showStoreDialog() {
+        showAppToast("Loading model store...", false)
+        thread(start = true, name = "aimbuddy-store-fetch") {
+            try {
+                val models = storeRepository.fetchAvailableModels()
+                runOnUiThread {
+                    showStoreListDialog(models)
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    showAppToast("Store fetch failed: ${e.message}", true)
+                }
+            }
+        }
+    }
+
+    private fun showStoreListDialog(storeModels: List<StoreModelDefinition>) {
+        if (storeModels.isEmpty()) {
+            showAppToast("No models available in store folder yet", true)
+            return
+        }
+
+        val installedIds = modelCatalog.getInstalledModels().map { it.id }.toSet()
+        val labels = storeModels.map { model ->
+            val installed = if (installedIds.contains(model.id)) " (installed)" else ""
+            val demo = if (!model.isDownloadable) " [demo]" else ""
+            val size = if (model.totalSizeBytes > 0L) formatBytes(model.totalSizeBytes) else "metadata only"
+            "${model.title}$demo - $size$installed"
+        }.toTypedArray()
+
+        AlertDialog.Builder(this)
+            .setTitle("Model Store")
+            .setItems(labels) { _, which ->
+                val selected = storeModels[which]
+                showStoreModelDetailDialog(selected)
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun showStoreModelDetailDialog(model: StoreModelDefinition) {
+        val existing = modelCatalog.getInstalledModels().firstOrNull { it.id == model.id }
+        val details = StringBuilder()
+            .append(model.title)
+            .append("\n\n")
+            .append(model.description)
+            .append("\n\n")
+            .append("Param: ")
+            .append(formatBytes(model.paramSizeBytes))
+            .append("\n")
+            .append("Bin: ")
+            .append(formatBytes(model.binSizeBytes))
+            .append("\n")
+            .append("Total: ")
+            .append(formatBytes(model.totalSizeBytes))
+            .append("\n")
+            .append("Type: ")
+            .append(if (model.isDownloadable) "Downloadable" else "Demo / Metadata only")
+            .toString()
+
+        val builder = AlertDialog.Builder(this)
+            .setTitle("Store Model")
+            .setMessage(details)
+            .setNegativeButton("Back", null)
+
+        if (existing != null && existing.canUse()) {
+            builder.setPositiveButton("Use") { _, _ ->
+                modelCatalog.setActiveModel(existing.id)
+                applyActiveModelSelection()
+                reinitializeNativeIfIdle()
+            }
+        } else if (model.isDownloadable) {
+            builder.setPositiveButton("Download") { _, _ ->
+                downloadStoreModel(model)
+            }
+        } else {
+            builder.setPositiveButton("OK", null)
+        }
+
+        builder.show()
+    }
+
+    private fun downloadStoreModel(model: StoreModelDefinition) {
+        showAppToast("Downloading ${model.title}...", false)
+        thread(start = true, name = "aimbuddy-store-download") {
+            try {
+                val modelId = modelCatalog.sanitizeModelId(model.id)
+                val targetDir = File(filesDir, "models/$modelId")
+                val downloaded = storeRepository.downloadModel(model, targetDir)
+
+                val installed = InstalledModel(
+                    id = modelId,
+                    title = model.title,
+                    description = model.description,
+                    source = ModelSource.STORE,
+                    paramPath = downloaded.first.absolutePath,
+                    binPath = downloaded.second.absolutePath,
+                    totalSizeBytes = downloaded.first.length() + downloaded.second.length()
+                )
+                modelCatalog.addOrUpdateModel(installed, makeActive = true)
+
+                runOnUiThread {
+                    applyActiveModelSelection()
+                    reinitializeNativeIfIdle()
+                    showAppToast("Downloaded and switched to ${model.title}", false)
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    showAppToast("Download failed: ${e.message}", true)
+                }
+            }
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1024L) {
+            return "${bytes} B"
+        }
+        val kb = bytes / 1024.0
+        if (kb < 1024.0) {
+            return String.format("%.1f KB", kb)
+        }
+        val mb = kb / 1024.0
+        if (mb < 1024.0) {
+            return String.format("%.2f MB", mb)
+        }
+        val gb = mb / 1024.0
+        return String.format("%.2f GB", gb)
     }
 
     private fun setupOverlay() {
@@ -922,6 +1148,7 @@ class MainActivity : AppCompatActivity() {
     private fun ControlScreen(
         isRunning: Boolean,
         statusText: String,
+        activeModelText: String,
         onStart: () -> Unit,
         onStop: () -> Unit
     ) {
@@ -976,6 +1203,13 @@ class MainActivity : AppCompatActivity() {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center
                 )
+                Text(
+                    text = activeModelText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.tertiary,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(bottom = 14.dp)
+                )
 
                 Row(
                     modifier = Modifier.padding(vertical = 8.dp),
@@ -1025,46 +1259,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
-    /**
-     * Request Root Access for Aimbot (uinput)
-     * 
-     * The new aimbot implementation uses the Linux kernel 'uinput' module to inject
-     * touch events directly at the driver level. This bypasses Android's Accessibility
-     * Service APIs, offering significantly lower latency (<3ms) and higher precision.
-     * 
-     * To access /dev/uinput, the application requires ROOT privileges ("su").
-     * This function attempts to execute 'su' to trigger the Magisk/SuperSU prompt.
-     */
-    private fun requestRootAccess(): Boolean {
-        return try {
-            Log.i(TAG, "Requesting ROOT access for uinput...")
-            val process = Runtime.getRuntime().exec("su")
-            val outputStream = java.io.DataOutputStream(process.outputStream)
-            
-            // Fix permissions for /dev/uinput so we can access it from non-root context
-            outputStream.writeBytes("chmod 666 /dev/uinput\n")
-            // Disable SELinux enforcement (common fix for custom input devices on Android)
-            outputStream.writeBytes("setenforce 0\n")
-            
-            outputStream.writeBytes("exit\n")
-            outputStream.flush()
-            
-            process.waitFor()
-            val exitValue = process.exitValue()
-            
-            if (exitValue == 0) {
-                Log.i(TAG, "ROOT access granted and uinput permissions fixed!")
-                true
-            } else {
-                Log.e(TAG, "ROOT access denied (exit code $exitValue)")
-                false
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to execute 'su': ${e.message}")
-            false
-        }
-    }
-
     /**
      * Show dialog if Root is missing
      */

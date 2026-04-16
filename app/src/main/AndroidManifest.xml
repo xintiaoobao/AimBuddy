@@ -10,6 +10,9 @@
     
     <!-- Wake lock to prevent CPU throttling during active use -->
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+
+    <!-- Network access for GitHub-backed model store -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     
     <!-- Vulkan GPU feature — optional so the app still runs on devices without Vulkan -->
     <uses-feature android:name="android.hardware.vulkan.level" android:version="1" android:required="false"/>
