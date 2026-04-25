@@ -586,19 +586,101 @@ void touchInputStop() {
 
 } // namespace
 
-TouchHelper::TouchHelper() = default;
+TouchHelper::TouchHelper()
+    : backend_(TouchBackend::UINPUT)
+    , initialized_(false)
+    , shizukuBridgeAvailable_(false)
+    , javaVm_(nullptr)
+    , activityClassGlobal_(nullptr)
+    , shizukuMoveMethod_(nullptr)
+    , shizukuUpMethod_(nullptr) {}
 
 TouchHelper::~TouchHelper() {
+    if (javaVm_ && activityClassGlobal_) {
+        JNIEnv* env = nullptr;
+        if (javaVm_->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK && env) {
+            env->DeleteGlobalRef(activityClassGlobal_);
+        }
+    }
     shutdown();
 }
 
+void TouchHelper::setBackend(TouchBackend backend) {
+    if (backend_ == backend) {
+        return;
+    }
+    releaseActiveTouch();
+    shutdownUinput();
+    initialized_ = false;
+    backend_ = backend;
+}
+
+void TouchHelper::setJniBridge(JavaVM* vm, JNIEnv* env, jobject activityInstance) {
+    javaVm_ = vm;
+    if (!env || !activityInstance) {
+        return;
+    }
+
+    if (activityClassGlobal_) {
+        env->DeleteGlobalRef(activityClassGlobal_);
+        activityClassGlobal_ = nullptr;
+    }
+
+    jclass localClass = env->GetObjectClass(activityInstance);
+    if (!localClass) {
+        return;
+    }
+    activityClassGlobal_ = static_cast<jclass>(env->NewGlobalRef(localClass));
+    env->DeleteLocalRef(localClass);
+
+    shizukuMoveMethod_ = nullptr;
+    shizukuUpMethod_ = nullptr;
+}
+
+void TouchHelper::setShizukuBridgeAvailable(bool available) {
+    shizukuBridgeAvailable_ = available;
+    if (!available && backend_ == TouchBackend::SHIZUKU) {
+        shutdown();
+    }
+}
+
 bool TouchHelper::init() {
-    if (g_touchStart) {
+    if (initialized_) {
         return true;
     }
 
+    if (backend_ == TouchBackend::SHIZUKU) {
+        initialized_ = initShizuku();
+        return initialized_;
+    }
+
+    initialized_ = initUinput();
+    return initialized_;
+}
+
+bool TouchHelper::initUinput() {
+    if (g_touchStart) {
+        return true;
+    }
     touchInputStart();
     return g_touchStart;
+}
+
+bool TouchHelper::initShizuku() {
+    return shizukuBridgeAvailable_;
+}
+
+void TouchHelper::releaseActiveTouch() {
+    if (!initialized_) {
+        return;
+    }
+
+    if (backend_ == TouchBackend::SHIZUKU) {
+        callShizukuUp();
+        return;
+    }
+
+    sendTouchUp();
 }
 
 void TouchHelper::setScreenSize(int width, int height) {
@@ -607,19 +689,146 @@ void TouchHelper::setScreenSize(int width, int height) {
 
 void TouchHelper::touchDown(int slot, float x, float y) {
     (void)slot;
+    if (!initialized_ && !init()) {
+        return;
+    }
+
+    if (backend_ == TouchBackend::SHIZUKU) {
+        if (!callShizukuMove(x, y, true)) {
+            initialized_ = false;
+        }
+        return;
+    }
     sendTouchMove(static_cast<int>(x), static_cast<int>(y));
 }
 
 void TouchHelper::touchMove(int slot, float x, float y) {
     (void)slot;
+    if (!initialized_ && !init()) {
+        return;
+    }
+
+    if (backend_ == TouchBackend::SHIZUKU) {
+        if (!callShizukuMove(x, y, false)) {
+            initialized_ = false;
+        }
+        return;
+    }
     sendTouchMove(static_cast<int>(x), static_cast<int>(y));
 }
 
 void TouchHelper::touchUp(int slot) {
     (void)slot;
+    if (!initialized_) {
+        return;
+    }
+
+    if (backend_ == TouchBackend::SHIZUKU) {
+        if (!callShizukuUp()) {
+            initialized_ = false;
+        }
+        return;
+    }
     sendTouchUp();
 }
 
 void TouchHelper::shutdown() {
+    releaseActiveTouch();
+    shutdownUinput();
+    initialized_ = false;
+}
+
+bool TouchHelper::isInitialized() const {
+    return initialized_;
+}
+
+void TouchHelper::shutdownUinput() {
     touchInputStop();
+}
+
+bool TouchHelper::ensureJniMethods(JNIEnv* env) {
+    if (!env || !activityClassGlobal_) {
+        return false;
+    }
+
+    if (!shizukuMoveMethod_) {
+        shizukuMoveMethod_ = env->GetStaticMethodID(
+            activityClassGlobal_,
+            "nativeInjectShizukuAimMove",
+            "(FFZ)Z"
+        );
+    }
+    if (!shizukuUpMethod_) {
+        shizukuUpMethod_ = env->GetStaticMethodID(
+            activityClassGlobal_,
+            "nativeInjectShizukuAimUp",
+            "()Z"
+        );
+    }
+
+    return shizukuMoveMethod_ && shizukuUpMethod_;
+}
+
+bool TouchHelper::callShizukuMove(float x, float y, bool isFirst) {
+    if (!javaVm_ || !shizukuBridgeAvailable_) {
+        return false;
+    }
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (javaVm_->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        if (javaVm_->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            return false;
+        }
+        attached = true;
+    }
+
+    bool ok = false;
+    if (ensureJniMethods(env)) {
+        const jboolean result = env->CallStaticBooleanMethod(
+            activityClassGlobal_,
+            shizukuMoveMethod_,
+            static_cast<jfloat>(x),
+            static_cast<jfloat>(y),
+            static_cast<jboolean>(isFirst)
+        );
+        ok = (result == JNI_TRUE) && !env->ExceptionCheck();
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    }
+
+    if (attached) {
+        javaVm_->DetachCurrentThread();
+    }
+    return ok;
+}
+
+bool TouchHelper::callShizukuUp() {
+    if (!javaVm_ || !shizukuBridgeAvailable_) {
+        return false;
+    }
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (javaVm_->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        if (javaVm_->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            return false;
+        }
+        attached = true;
+    }
+
+    bool ok = false;
+    if (ensureJniMethods(env)) {
+        const jboolean result = env->CallStaticBooleanMethod(activityClassGlobal_, shizukuUpMethod_);
+        ok = (result == JNI_TRUE) && !env->ExceptionCheck();
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    }
+
+    if (attached) {
+        javaVm_->DetachCurrentThread();
+    }
+    return ok;
 }

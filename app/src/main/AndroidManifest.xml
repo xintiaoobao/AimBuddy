@@ -13,6 +13,9 @@
 
     <!-- Network access for GitHub-backed model store -->
     <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- Optional non-root input backend (Shizuku) -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23"/>
     
     <!-- Vulkan GPU feature — optional so the app still runs on devices without Vulkan -->
     <uses-feature android:name="android.hardware.vulkan.level" android:version="1" android:required="false"/>
@@ -57,6 +60,18 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <meta-data
+            android:name="moe.shizuku.client.V3_SUPPORT"
+            android:value="true" />
 
     </application>
 

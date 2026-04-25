@@ -114,4 +114,8 @@ dependencies {
     // Debug-only: keep tooling preview off the release build
     debugImplementation 'androidx.compose.ui:ui-tooling-preview'
     debugImplementation 'androidx.compose.ui:ui-tooling'
+
+    // Optional non-root input backend (Shizuku)
+    implementation 'dev.rikka.shizuku:api:13.1.5'
+    implementation 'dev.rikka.shizuku:provider:13.1.5'
 }

@@ -6,6 +6,7 @@
 #include "../input/touch_helper.h"
 #include "target_tracker.h"
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <thread>
 #include <vector>
@@ -48,6 +49,8 @@ private:
     std::atomic<bool> m_running;
     std::thread m_aimThread;
     std::mutex m_trackerMutex;
+    std::condition_variable m_targetUpdateCv;
+    std::atomic<uint64_t> m_targetUpdateSeq;
     
     void aimLoop();
     

@@ -43,6 +43,7 @@ static int g_screenWidth = 0;
 static int g_screenHeight = 0;
 static bool g_menuVisible = false;
 static std::atomic<bool> g_rootAvailable{false};  // Track root status
+static std::atomic<bool> g_shizukuAvailable{false};
 
 // Icon position synced from Kotlin layer (existing SVG icon)
 static ImVec2 g_iconPos = ImVec2(60.0f, 200.0f);  // Initial default
@@ -498,7 +499,8 @@ Java_com_aimbuddy_ImGuiGLSurface_nativeTick(JNIEnv* /* env */, jclass /* this */
             if (ImGui::Begin("AimBuddy v0.1.0-beta.1", nullptr, windowFlags)) {
                 g_menuSize = ImGui::GetWindowSize();
                 const bool rootAvailable = g_rootAvailable.load(std::memory_order_relaxed);
-                if (!rootAvailable) {
+                const bool shizukuAvailable = g_shizukuAvailable.load(std::memory_order_relaxed);
+                if (!rootAvailable && !shizukuAvailable) {
                     ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Root not granted (ESP mode)");
                 }
 
@@ -594,11 +596,29 @@ Java_com_aimbuddy_ImGuiGLSurface_nativeTick(JNIEnv* /* env */, jclass /* this */
                     }
 
                     if (ImGui::BeginTabItem("Aim")) {
-                        if (!rootAvailable) {
+                        int touchBackend = g_settings.touchBackend;
+                        const char* touchBackends[] = { "uinput (Root)", "Shizuku (Non-root)" };
+                        if (ImGui::Combo("Touch backend", &touchBackend, touchBackends, 2)) {
+                            g_settings.touchBackend = touchBackend;
+                            settingsDirty = true;
+                        }
+                        if (touchBackend == 0) {
+                            ImGui::TextDisabled("Backend status: %s", rootAvailable ? "ready" : "root missing");
+                        } else {
+                            ImGui::TextDisabled("Backend status: %s", shizukuAvailable ? "ready" : "Shizuku unavailable");
+                        }
+                        ImGui::Separator();
+
+                        const bool backendReady = (touchBackend == 0) ? rootAvailable : shizukuAvailable;
+                        if (!backendReady) {
                             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
-                            ImGui::TextUnformatted("Root access required for assisted input controls.");
+                            if (touchBackend == 0) {
+                                ImGui::TextUnformatted("Root access required for uinput assisted input.");
+                            } else {
+                                ImGui::TextUnformatted("Shizuku service/permission required for non-root assisted input.");
+                            }
                             ImGui::PopStyleColor();
-                            ImGui::TextDisabled("Grant root in Magisk/KernelSU and reopen Start flow.");
+                            ImGui::TextDisabled("Grant required permission and reopen Start flow.");
                         } else {
                             bool enabled = settings->aimbotEnabled.load(std::memory_order_relaxed);
                             if (ImGui::Checkbox("Enable Aim Assist", &enabled)) {
@@ -943,6 +963,12 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_aimbuddy_ImGuiGLSurface_nativeSetRootAvailable(JNIEnv* /* env */, jclass /* this */, jboolean available) {
     g_rootAvailable.store(available == JNI_TRUE, std::memory_order_relaxed);
     LOGI("Root status updated: %s", available ? "AVAILABLE" : "NOT AVAILABLE");
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_aimbuddy_ImGuiGLSurface_nativeSetShizukuAvailable(JNIEnv* /* env */, jclass /* this */, jboolean available) {
+    g_shizukuAvailable.store(available == JNI_TRUE, std::memory_order_relaxed);
+    LOGI("Shizuku status updated: %s", available ? "AVAILABLE" : "NOT AVAILABLE");
 }
 
 extern "C" bool IsImGuiMenuVisible() {

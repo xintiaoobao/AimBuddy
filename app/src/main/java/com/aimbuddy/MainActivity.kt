@@ -75,8 +75,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
+import rikka.shizuku.Shizuku
 
 /**
  * MainActivity - ESP overlay control interface
@@ -90,6 +92,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "ESP_MainActivity"
         private const val REQUEST_MEDIA_PROJECTION = 1001
         private const val REQUEST_OVERLAY_PERMISSION = 1002
+        private const val REQUEST_SHIZUKU_PERMISSION = 2001
 
         // Capture resolution (720p for optimal SD888 performance)
         private const val CAPTURE_WIDTH = 1280
@@ -106,6 +109,20 @@ class MainActivity : AppCompatActivity() {
         private const val STORE_OWNER = "1337Xcode"
         private const val STORE_REPO = "AimBuddy"
         private const val STORE_BRANCH = "master"
+
+        private var activityRef: WeakReference<MainActivity>? = null
+
+        @JvmStatic
+        fun nativeInjectShizukuAimMove(screenX: Float, screenY: Float, isFirst: Boolean): Boolean {
+            val activity = activityRef?.get() ?: return false
+            return activity.injectShizukuAimMove(screenX, screenY, isFirst)
+        }
+
+        @JvmStatic
+        fun nativeInjectShizukuAimUp(): Boolean {
+            val activity = activityRef?.get() ?: return false
+            return activity.injectShizukuAimUp()
+        }
 
         init {
             System.loadLibrary("esp_native")
@@ -127,7 +144,45 @@ class MainActivity : AppCompatActivity() {
     private val isStarting = AtomicBoolean(false)
     private val rootCheckInProgress = AtomicBoolean(false)
     private val rootAvailable = AtomicBoolean(false)
+    private val shizukuAvailable = AtomicBoolean(false)
     private var pendingStartAfterRoot = false
+    private var pendingStartAfterShizuku = false
+    private var pendingShizukuPermissionRequest = false
+    private var shizukuWaitStartedAt = 0L
+    private var shizukuInjector: ShizukuInputInjector? = null
+    private val shizukuBinderReceivedListener = Shizuku.OnBinderReceivedListener {
+        runOnUiThread {
+            refreshShizukuState()
+            if (pendingStartAfterShizuku && !isStarting.get()) {
+                requestShizukuThenMediaProjection()
+            }
+        }
+    }
+    private val shizukuBinderDeadListener = Shizuku.OnBinderDeadListener {
+        runOnUiThread {
+            refreshShizukuState(forceUnavailable = true)
+            if (nativeGetTouchBackend() == 1) {
+                showAppToast("Shizuku disconnected. Reconnect and press Start again.", true)
+            }
+        }
+    }
+    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+        if (requestCode != REQUEST_SHIZUKU_PERMISSION) {
+            return@OnRequestPermissionResultListener
+        }
+        val granted = grantResult == PackageManager.PERMISSION_GRANTED
+        pendingShizukuPermissionRequest = false
+        refreshShizukuState()
+        if (granted) {
+            showAppToast("Shizuku permission granted.", false)
+        } else {
+            showAppToast("Shizuku permission denied. Aim assist stays visual-only.", true)
+        }
+        if (pendingStartAfterShizuku) {
+            pendingStartAfterShizuku = false
+            requestMediaProjectionPermission()
+        }
+    }
     private var pendingImportParamUri: Uri? = null
     private var pendingImportName: String = "local-model"
 
@@ -185,6 +240,9 @@ class MainActivity : AppCompatActivity() {
     private external fun nativeIsRunning(): Boolean
     private external fun nativeInitAimbot(): Boolean
     private external fun nativeSetModelPaths(paramPath: String?, binPath: String?)
+    private external fun nativeSetTouchBackend(backend: Int)
+    private external fun nativeGetTouchBackend(): Int
+    private external fun nativeSetShizukuBridgeAvailable(available: Boolean)
 
     private val importParamLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) {
@@ -237,6 +295,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        activityRef = WeakReference(this)
         
         // Force landscape orientation
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
@@ -311,13 +370,22 @@ class MainActivity : AppCompatActivity() {
         } else {
             setStatus("Status: Ready")
             ImGuiGLSurface.nativeSetRootAvailable(false)
+            refreshShizukuState()
             maybeShowOpenSourceDialogOnce()
         }
+
+        Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
+        Shizuku.addBinderReceivedListenerSticky(shizukuBinderReceivedListener)
+        Shizuku.addBinderDeadListener(shizukuBinderDeadListener)
     }
     
     override fun onDestroy() {
         Log.i(TAG, "onDestroy")
         stopESP()
+        Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
+        Shizuku.removeBinderReceivedListener(shizukuBinderReceivedListener)
+        Shizuku.removeBinderDeadListener(shizukuBinderDeadListener)
+        activityRef = null
         imageThread.quitSafely()
         nativeShutdown()
         super.onDestroy()
@@ -384,6 +452,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestRootThenMediaProjection() {
+        val backend = resolveEffectiveTouchBackend(nativeGetTouchBackend().coerceIn(0, 1))
+        nativeSetTouchBackend(backend)
+
+        if (backend == 1) {
+            requestShizukuThenMediaProjection()
+            return
+        }
+
         // Root is optional for ESP runtime. If already granted, continue immediately.
         if (rootAvailable.get()) {
             requestMediaProjectionPermission()
@@ -393,24 +469,99 @@ class MainActivity : AppCompatActivity() {
         pendingStartAfterRoot = true
         setStatus("Status: Waiting for Root Permission")
         showAppToast("Approve root request if you want assisted input.", false)
-        beginAsyncRootCheck(showDialogOnFailure = false) { hasRoot ->
+        beginAsyncRootCheck { hasRoot ->
             if (!pendingStartAfterRoot) return@beginAsyncRootCheck
 
             if (hasRoot) {
                 setStatus("Status: Root Granted")
                 requestMediaProjectionPermission()
             } else {
-                setStatus("Status: Ready")
-                showRootMissingDialog(
-                    onRetry = {
-                        requestRootThenMediaProjection()
-                    },
-                    onContinue = {
-                        requestMediaProjectionPermission()
-                    }
-                )
+                pendingStartAfterRoot = false
+                nativeSetTouchBackend(1)
+                showAppToast("Root unavailable. Switched to Shizuku non-root input.", false)
+                setStatus("Status: Using Shizuku Backend")
+                requestShizukuThenMediaProjection()
             }
         }
+    }
+
+    private fun requestShizukuThenMediaProjection() {
+        if (!pendingStartAfterShizuku) {
+            shizukuWaitStartedAt = System.currentTimeMillis()
+        }
+        pendingStartAfterShizuku = true
+        setStatus("Status: Waiting for Shizuku Permission")
+
+        refreshShizukuState()
+        if (!Shizuku.pingBinder()) {
+            if (isRootLikelyAvailable()) {
+                pendingStartAfterShizuku = false
+                nativeSetTouchBackend(0)
+                showAppToast("Shizuku unavailable. Switched to root uinput input.", false)
+                setStatus("Status: Using Root Backend")
+                requestRootThenMediaProjection()
+            } else {
+                showAppToast("Waiting for Shizuku connection...", false)
+                val waitedMs = System.currentTimeMillis() - shizukuWaitStartedAt
+                if (waitedMs > 4000) {
+                    pendingStartAfterShizuku = false
+                    setStatus("Status: Shizuku Not Connected")
+                    showShizukuConnectionHelpDialog()
+                }
+            }
+            return
+        }
+
+        if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+            shizukuAvailable.set(true)
+            nativeSetShizukuBridgeAvailable(true)
+            ImGuiGLSurface.nativeSetShizukuAvailable(true)
+            if (statusTextState != "Status: Init Failed") {
+                nativeInitAimbot()
+            }
+            pendingStartAfterShizuku = false
+            requestMediaProjectionPermission()
+            return
+        }
+
+        if (!pendingShizukuPermissionRequest) {
+            pendingShizukuPermissionRequest = true
+            try {
+                Shizuku.requestPermission(REQUEST_SHIZUKU_PERMISSION)
+                showAppToast("Approve Shizuku permission request.", false)
+            } catch (e: Throwable) {
+                pendingShizukuPermissionRequest = false
+                pendingStartAfterShizuku = false
+                showAppToast("Failed to request Shizuku permission: ${e.message}", true)
+                setStatus("Status: Ready")
+            }
+        }
+    }
+
+    private fun showShizukuConnectionHelpDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("Shizuku Not Connected")
+            .setMessage(
+                "AimBuddy could not receive Shizuku binder.\n\n" +
+                    "1) Open Shizuku app and make sure service is running\n" +
+                    "2) Confirm AimBuddy is allowed in Shizuku app\n" +
+                    "3) Return and press Start again"
+            )
+            .setPositiveButton("Open Shizuku") { _, _ ->
+                val launch = packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+                if (launch != null) {
+                    startActivity(launch)
+                } else {
+                    showAppToast("Shizuku app not found.", true)
+                }
+            }
+            .setNegativeButton("Retry") { _, _ ->
+                requestShizukuThenMediaProjection()
+            }
+            .setNeutralButton("Continue Visual Only") { _, _ ->
+                requestMediaProjectionPermission()
+            }
+            .show()
     }
 
     private fun requestMediaProjectionPermission() {
@@ -675,7 +826,7 @@ class MainActivity : AppCompatActivity() {
         nativeShutdown()
         applyActiveModelSelection()
         if (nativeInit(assets, screenWidth, screenHeight)) {
-            if (rootAvailable.get()) {
+            if (rootAvailable.get() || shizukuAvailable.get()) {
                 nativeInitAimbot()
             }
             setStatus("Status: Ready")
@@ -889,6 +1040,58 @@ class MainActivity : AppCompatActivity() {
         }
         val gb = mb / 1024.0
         return String.format("%.2f GB", gb)
+    }
+
+    private fun refreshShizukuState(forceUnavailable: Boolean = false) {
+        val available = if (forceUnavailable) {
+            false
+        } else {
+            try {
+                Shizuku.pingBinder() &&
+                    Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+            } catch (_: Throwable) {
+                false
+            }
+        }
+
+        shizukuAvailable.set(available)
+        if (available && shizukuInjector == null) {
+            shizukuInjector = ShizukuInputInjector()
+        }
+        if (!available) {
+            shizukuInjector = null
+        }
+
+        nativeSetShizukuBridgeAvailable(available)
+        ImGuiGLSurface.nativeSetShizukuAvailable(available)
+    }
+
+    private fun isRootLikelyAvailable(): Boolean {
+        return rootAvailable.get() || RootUtils.isRootAvailable()
+    }
+
+    private fun resolveEffectiveTouchBackend(preferredBackend: Int): Int {
+        val rootReady = isRootLikelyAvailable()
+        val shizukuReady = shizukuAvailable.get()
+
+        return when (preferredBackend) {
+            0 -> if (rootReady) 0 else if (shizukuReady) 1 else 0
+            1 -> if (shizukuReady) 1 else if (rootReady) 0 else 1
+            else -> preferredBackend.coerceIn(0, 1)
+        }
+    }
+
+    private fun injectShizukuAimMove(screenX: Float, screenY: Float, isFirst: Boolean): Boolean {
+        if (!shizukuAvailable.get()) {
+            return false
+        }
+        val injector = shizukuInjector ?: return false
+        return injector.injectAimMove(screenX, screenY, isFirst)
+    }
+
+    private fun injectShizukuAimUp(): Boolean {
+        val injector = shizukuInjector ?: return false
+        return injector.releaseAim()
     }
 
     private fun setupOverlay() {
@@ -1259,24 +1462,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
-    /**
-     * Show dialog if Root is missing
-     */
-    private fun showRootMissingDialog(onRetry: () -> Unit, onContinue: () -> Unit) {
-        AlertDialog.Builder(this)
-            .setTitle("Root Access Required")
-            .setMessage("Assisted input needs root access.\n\nIf your root app uses fingerprint or MFA, approve it first and wait for confirmation.\n\nYou can retry root now, or continue in Visual Assist mode.")
-            .setPositiveButton("Retry") { _, _ ->
-                onRetry()
-            }
-            .setNegativeButton("Continue Visual Only") { _, _ ->
-                onContinue()
-            }
-            .setCancelable(false)
-            .show()
-    }
-
-    private fun beginAsyncRootCheck(showDialogOnFailure: Boolean, onCompleted: ((Boolean) -> Unit)? = null) {
+    private fun beginAsyncRootCheck(onCompleted: ((Boolean) -> Unit)? = null) {
         if (!rootCheckInProgress.compareAndSet(false, true)) {
             Log.i(TAG, "Root check already in progress")
             return
@@ -1298,7 +1484,9 @@ class MainActivity : AppCompatActivity() {
                     if (statusTextState != "Status: Init Failed") {
                         if (nativeInitAimbot()) {
                             Log.i(TAG, "Aimbot initialized successfully")
-                            showAppToast("Root granted! Aimbot enabled.", false)
+                            if (nativeGetTouchBackend() == 0) {
+                                showAppToast("Root granted! Aimbot enabled.", false)
+                            }
                         } else {
                             Log.w(TAG, "Aimbot init failed after root grant")
                             showAppToast("Root granted but aimbot init failed. Check /dev/uinput.", true)
@@ -1306,16 +1494,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 } else {
                     Log.w(TAG, "Root denied or unavailable")
-                    if (showDialogOnFailure && !isFinishing && !isDestroyed) {
-                        Handler(Looper.getMainLooper()).postDelayed({
-                            if (!isFinishing && !isDestroyed) {
-                                showRootMissingDialog(
-                                    onRetry = { beginAsyncRootCheck(showDialogOnFailure = false, onCompleted = onCompleted) },
-                                    onContinue = { }
-                                )
-                            }
-                        }, 400)
-                    }
                 }
                 onCompleted?.invoke(hasRoot)
             }

@@ -36,6 +36,7 @@ struct UnifiedSettings {
     float touchY = 150.0f;
     float touchRadius = 250.0f;
     float aimDelay = 3.5f;
+    int32_t touchBackend = 1; // 0 = uinput(root), 1 = Shizuku(non-root)
     
     int32_t maxLostFrames = 8;
     float iouThreshold = 0.3f;
@@ -132,6 +133,7 @@ struct UnifiedSettings {
         maxAimDistance = (maxAimDistance < 100.0f) ? 100.0f : (maxAimDistance > 1000.0f) ? 1000.0f : maxAimDistance;
         touchRadius = (touchRadius < 50.0f) ? 50.0f : (touchRadius > 500.0f) ? 500.0f : touchRadius;
         aimDelay = (aimDelay < 0.0f) ? 0.0f : (aimDelay > 50.0f) ? 50.0f : aimDelay;
+        touchBackend = (touchBackend < 0) ? 0 : (touchBackend > 1) ? 1 : touchBackend;
         boxThickness = (boxThickness < 1) ? 1 : (boxThickness > 10) ? 10 : boxThickness;
         boxColorR = (boxColorR < 0.0f) ? 0.0f : (boxColorR > 1.0f) ? 1.0f : boxColorR;
         boxColorG = (boxColorG < 0.0f) ? 0.0f : (boxColorG > 1.0f) ? 1.0f : boxColorG;

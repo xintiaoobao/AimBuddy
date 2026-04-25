@@ -431,6 +431,8 @@ Java_com_aimbuddy_MainActivity_nativeInit(JNIEnv* env, jobject thiz,
     // Create TouchHelper and AimbotController (but DON'T init touch yet)
     // Touch init happens in nativeInitAimbot() AFTER root permissions are set
     g_touchHelper = std::make_unique<TouchHelper>();
+    g_touchHelper->setJniBridge(g_jvm, env, thiz);
+    g_touchHelper->setBackend(g_settings.touchBackend == 1 ? TouchBackend::SHIZUKU : TouchBackend::UINPUT);
     g_touchHelper->setScreenSize(screenWidth, screenHeight);
     
     // Create aimbot controller with touch helper
@@ -633,8 +635,11 @@ Java_com_aimbuddy_MainActivity_nativeInitAimbot(JNIEnv* env, jobject thiz) {
     if (!g_touchHelper) {
         LOGE("TouchHelper is null, creating new one");
         g_touchHelper = std::make_unique<TouchHelper>();
-        g_touchHelper->setScreenSize(g_screenWidth, g_screenHeight);
     }
+
+    g_touchHelper->setJniBridge(g_jvm, env, thiz);
+    g_touchHelper->setBackend(g_settings.touchBackend == 1 ? TouchBackend::SHIZUKU : TouchBackend::UINPUT);
+    g_touchHelper->setScreenSize(g_screenWidth, g_screenHeight);
     
     // THIS is where we actually init the touch device (needs root)
     if (g_touchHelper->init()) {
@@ -653,9 +658,33 @@ Java_com_aimbuddy_MainActivity_nativeInitAimbot(JNIEnv* env, jobject thiz) {
         return JNI_TRUE;
     }
     
-    LOGE("TouchHelper init FAILED!");
-    LOGE("Check: 1) Root granted  2) /dev/uinput exists  3) /dev/input/event* accessible");
+    LOGE("TouchHelper init FAILED for backend=%d", g_settings.touchBackend);
+    LOGE("Check: uinput requires root, Shizuku requires active service + permission");
     return JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_aimbuddy_MainActivity_nativeSetTouchBackend(JNIEnv* /* env */, jobject /* thiz */, jint backend) {
+    const int clamped = std::max(0, std::min(1, static_cast<int>(backend)));
+    g_settings.touchBackend = clamped;
+    g_settings.validate();
+
+    if (g_touchHelper) {
+        g_touchHelper->setBackend(clamped == 1 ? TouchBackend::SHIZUKU : TouchBackend::UINPUT);
+    }
+    LOGI("Touch backend set to %d", clamped);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_aimbuddy_MainActivity_nativeGetTouchBackend(JNIEnv* /* env */, jobject /* thiz */) {
+    return g_settings.touchBackend;
+}
+
+JNIEXPORT void JNICALL
+Java_com_aimbuddy_MainActivity_nativeSetShizukuBridgeAvailable(JNIEnv* /* env */, jobject /* thiz */, jboolean available) {
+    if (g_touchHelper) {
+        g_touchHelper->setShizukuBridgeAvailable(available == JNI_TRUE);
+    }
 }
 
 JNIEXPORT void JNICALL

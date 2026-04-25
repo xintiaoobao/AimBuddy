@@ -450,6 +450,8 @@ void AimbotController::sanitizeMovement(float dx, float dy, float distance,
 }
 
 void AimbotController::applyMovement(float moveX, float moveY, const UnifiedSettings& settings) {
+    m_touch->setBackend(settings.touchBackend == 1 ? TouchBackend::SHIZUKU : TouchBackend::UINPUT);
+
     const float blend = m_isAiming ? 0.72f : 1.0f;
     moveX = m_prevMoveX * (1.0f - blend) + moveX * blend;
     moveY = m_prevMoveY * (1.0f - blend) + moveY * blend;
