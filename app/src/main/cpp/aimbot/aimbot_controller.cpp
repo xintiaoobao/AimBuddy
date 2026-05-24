@@ -260,7 +260,16 @@ void AimbotController::aimAt(const TrackedTarget& target) {
     }
 
     sanitizeMovement(dx, dy, distance, settings, modeStrength, moveX, moveY);
-    
+
+    static int s_aimAtLog = 0;
+    if (++s_aimAtLog >= 30) {
+        s_aimAtLog = 0;
+        __android_log_print(ANDROID_LOG_INFO, "AimDiag",
+            "target=(%.0f,%.0f) cross=(%.0f,%.0f) dx=%.1f dy=%.1f dist=%.1f mv=%.2f,%.2f mode=%d",
+            aimPoint.x, aimPoint.y, m_crosshairX, m_crosshairY,
+            dx, dy, distance, moveX, moveY, settings.aimMode);
+    }
+
     applyMovement(moveX, moveY, settings);
 }
 
@@ -511,7 +520,15 @@ void AimbotController::applyMovement(float moveX, float moveY, const UnifiedSett
     }
     
     m_touch->touchMove(AIM_SLOT, m_touchX, m_touchY);
-    
+
+    static int s_aimLogCounter = 0;
+    if (++s_aimLogCounter >= 30) {
+        s_aimLogCounter = 0;
+        __android_log_print(ANDROID_LOG_INFO, "AimDiag",
+            "mv=%.2f,%.2f tx=%.0f ty=%.0f tcx=%.0f tcy=%.0f aiming=%d",
+            moveX, moveY, m_touchX, m_touchY, touchCenterX, touchCenterY, m_isAiming ? 1 : 0);
+    }
+
     if (settings.aimDelay > 0.0f) {
         usleep(static_cast<useconds_t>(settings.aimDelay * 1000.0f));
     }
