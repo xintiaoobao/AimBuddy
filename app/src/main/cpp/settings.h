@@ -249,7 +249,7 @@ namespace Config {
     #define ENABLE_INFO_LOGGING 1
     #define ENABLE_WARN_LOGGING 1
     #define ENABLE_ERROR_LOGGING 1
-    #define ENABLE_PROFILING 0
+    #define ENABLE_PROFILING 1
 #endif
 
 #endif // ESP_SETTINGS_H
