@@ -36,14 +36,14 @@ namespace Config {
     // Model Configuration
     // ============================================================================
     
-    /// YOLOv26n input size (optimized for 120 FPS target)
-    constexpr int MODEL_INPUT_SIZE = 256;
+    /// Model input size (must match exported model)
+    constexpr int MODEL_INPUT_SIZE = 320;
     
     /// Model parameter file name
-    constexpr const char* MODEL_PARAM_FILE = "models/yolo26n-opt.param";
+    constexpr const char* MODEL_PARAM_FILE = "models/SJZ.ncnn.param";
     
     /// Model binary file name
-    constexpr const char* MODEL_BIN_FILE = "models/yolo26n-opt.bin";
+    constexpr const char* MODEL_BIN_FILE = "models/SJZ.ncnn.bin";
     
     /// Default confidence threshold for detections
     constexpr float DEFAULT_CONFIDENCE_THRESHOLD = 0.5f;
@@ -59,8 +59,8 @@ namespace Config {
     // Detection Class Configuration
     // ============================================================================
     
-    /// Number of classes in the model (single-class: enemy)
-    constexpr int NUM_CLASSES = 1;
+    /// Number of classes in the model (SJZ: 4 classes)
+    constexpr int NUM_CLASSES = 4;
     
     /// Class ID for enemy (the only class we want to detect/highlight)
     constexpr int ENEMY_CLASS_ID = 0;
